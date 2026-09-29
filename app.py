@@ -1,39 +1,49 @@
 """
-Disease Outbreak Early Warning System — backend API (v2).
+Disease Outbreak Early Warning System — backend API (v3).
 
-Key change from v1: this version has real accounts and a real privacy split.
-- The public (no login) only ever sees aggregated warning zones — never
-  individual reports, never who reported what.
-- Any signed-in user can submit a report; the server takes their GPS
-  coordinates from the request body (the browser/device supplies them via
-  the Geolocation API — the frontend handles that), not a manually chosen
-  zone.
-- Only accounts with role="admin" can see raw report data, counts, and the
-  full clustering/anomaly detail.
-- The database starts EMPTY. There is no seed/mock data — hotspots only
-  appear once real reports come in. See compute_hotspots() for how "enough
-  reports" is defined while there's little history to build a baseline from.
+Major change from v2: NO accounts, NO login, NO admin panel. Everyone who
+opens the site sees the same thing: predicted outbreak clusters, case
+counts per hospital/locality, and related news. There is no raw personal
+data to protect because there are no personal accounts — hospital reports
+are aggregate daily counts (not individual patient records), and citizen
+reports are anonymous (no identity attached at all).
 
-Becoming an admin: signup accepts an optional `admin_code` field. If it
-matches the ADMIN_SIGNUP_CODE environment variable, the new account is
-created with role="admin". Set that env var on your host (e.g. Render →
-Environment) to something private, then sign up once using that code to
-create your own admin account. Leave the env var unset and nobody can
-create an admin account via signup.
+Data sources:
+- Hospitals: a small fixed set of nearby hospitals (seeded in the database
+  as a directory — see HOSPITALS below). In a real deployment these would
+  push data automatically from each hospital's own system; here, any
+  client can POST a daily case count for a hospital + disease. This is a
+  simulation of a real-time feed, not a real hospital integration — there
+  is deliberately no authentication on this endpoint, per the project's
+  new requirement to drop all logins. That is a real, known weakness
+  (anyone could submit fake hospital numbers) — worth flagging to
+  reviewers, and worth fixing with an API key per hospital before any real
+  use.
+- Citizens: anonymous reports of a disease/symptom + GPS location. No
+  account, no identity stored — just a coordinate, a disease label, and a
+  timestamp.
+
+Prediction, not just detection: for each of a fixed list of diseases, at
+each hospital's locality, the last 14 days of combined case data (hospital
+counts at full weight, citizen reports at partial weight — see
+CITIZEN_WEIGHT) are turned into a daily count series. The last 3 days are
+compared against the preceding week's average. A rising trend over a
+minimum case floor is flagged as a predicted outbreak, with a risk level
+based on how steep the rise is. Because this runs independently per
+disease per locality, several different outbreaks can be flagged at once
+across different areas — that's the "numerous outbreaks possible" the
+project asked for.
 
 Endpoints:
-  POST /api/auth/signup      -> {username, password, admin_code?} -> {token, username, role}
-  POST /api/auth/login       -> {username, password} -> {token, username, role}
-  GET  /api/auth/me          -> current user from Authorization: Bearer <token>
-
-  POST /api/reports          -> (auth required) {lat, lng, symptom} -> creates a report
-  GET  /api/public/hotspots  -> (no auth) aggregated warning zones only
-
-  GET  /api/admin/reports    -> (admin only) raw report rows
-  GET  /api/admin/clusters   -> (admin only) full cluster detail (counts + centers)
-  GET  /api/admin/summary    -> (admin only) dashboard counters
-
-  GET  /api/health           -> liveness check
+  GET  /api/health              -> liveness check
+  GET  /api/hospitals           -> directory of hospitals (id, name, lat, lng)
+  POST /api/hospital-reports    -> {hospital_id, disease, case_count, report_date?}
+  GET  /api/hospital-reports    -> raw daily hospital counts (?days=N)
+  POST /api/citizen-reports     -> {lat, lng, disease} — anonymous
+  GET  /api/predictions         -> the core output: predicted outbreaks
+  GET  /api/case-counts         -> per-hospital case totals, hospital vs citizen
+  GET  /api/news                -> ?disease=X&locality=Y -> related headlines
+  GET  /api/summary             -> dashboard counters
 
 Run:
   pip install -r requirements.txt
@@ -41,28 +51,42 @@ Run:
   -> serves on http://127.0.0.1:5000
 """
 
+import math
 import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
-from functools import wraps
+from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
+from xml.etree import ElementTree
 
 import pandas as pd
+import requests
 from flask import Flask, g, jsonify, request
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from sklearn.cluster import DBSCAN
-from werkzeug.security import check_password_hash, generate_password_hash
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbreak.db")
 
-# In production, set SECRET_KEY as an environment variable on your host.
-# Falling back to a fixed value is fine for local dev only.
-SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
-ADMIN_SIGNUP_CODE = os.environ.get("ADMIN_SIGNUP_CODE")  # unset = admin signup disabled
-TOKEN_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
-
 app = Flask(__name__)
-app.config["SECRET_KEY"] = SECRET_KEY
-serializer = URLSafeTimedSerializer(SECRET_KEY)
+
+DISEASES = ["Dengue", "Malaria", "Cholera", "Typhoid", "Influenza", "COVID-19", "Chikungunya"]
+
+# A small fixed set of nearby hospitals — seeded once, never duplicated.
+HOSPITALS = [
+    {"name": "Kamothe Community Hospital", "lat": 19.0176, "lng": 73.0961},
+    {"name": "Kharghar Multispecialty Hospital", "lat": 19.0474, "lng": 73.0662},
+    {"name": "Panvel Civic Hospital", "lat": 18.9894, "lng": 73.1175},
+    {"name": "Belapur General Hospital", "lat": 19.0234, "lng": 73.0356},
+    {"name": "Vashi Health Centre", "lat": 19.0771, "lng": 73.0000},
+]
+
+# How much one anonymous citizen report counts toward the case-equivalent
+# total used for trend detection, relative to one hospital-confirmed case
+# (weight 1.0). Self-reported symptoms are weaker evidence than a hospital
+# diagnosis, so they count for less but still contribute.
+CITIZEN_WEIGHT = 0.3
+
+MIN_CASES_FOR_PREDICTION = 4   # floor below which a "trend" is just noise
+GROWTH_RATIO_MODERATE = 1.5
+GROWTH_RATIO_HIGH = 2.5
+SUSTAINED_HIGH_ABS = 15        # flagged even without growth, if just persistently high
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +96,7 @@ serializer = URLSafeTimedSerializer(SECRET_KEY)
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
 
 
@@ -102,145 +126,150 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS users (
+        CREATE TABLE IF NOT EXISTS hospitals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL DEFAULT 'citizen',
-            created_at TEXT NOT NULL
+            name TEXT UNIQUE NOT NULL,
+            lat REAL NOT NULL,
+            lng REAL NOT NULL
         )
         """
     )
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS reports (
+        CREATE TABLE IF NOT EXISTS hospital_reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            hospital_id INTEGER NOT NULL,
+            disease TEXT NOT NULL,
+            case_count INTEGER NOT NULL,
+            report_date TEXT NOT NULL,
+            UNIQUE(hospital_id, disease, report_date),
+            FOREIGN KEY (hospital_id) REFERENCES hospitals (id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS citizen_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             lat REAL NOT NULL,
             lng REAL NOT NULL,
-            symptom TEXT NOT NULL,
-            reported_at TEXT NOT NULL,
-            FOREIGN KEY (user_id) REFERENCES users (id)
+            disease TEXT NOT NULL,
+            reported_at TEXT NOT NULL
         )
         """
     )
     conn.commit()
+
+    count = conn.execute("SELECT COUNT(*) AS c FROM hospitals").fetchone()[0]
+    if count == 0:
+        conn.executemany(
+            "INSERT INTO hospitals (name, lat, lng) VALUES (:name, :lat, :lng)", HOSPITALS
+        )
+        conn.commit()
     conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Auth helpers
-# ---------------------------------------------------------------------------
-def make_token(user_id):
-    return serializer.dumps({"uid": user_id})
-
-
-def verify_token(token):
-    try:
-        data = serializer.loads(token, max_age=TOKEN_MAX_AGE)
-        return data.get("uid")
-    except (BadSignature, SignatureExpired):
-        return None
-
-
-def get_current_user():
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return None
-    uid = verify_token(auth[len("Bearer "):])
-    if uid is None:
-        return None
-    row = get_db().execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-    return dict(row) if row else None
-
-
-def require_auth(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        user = get_current_user()
-        if user is None:
-            return jsonify({"error": "authentication required"}), 401
-        request.current_user = user
-        return f(*args, **kwargs)
-    return wrapper
-
-
-def require_admin(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        user = get_current_user()
-        if user is None:
-            return jsonify({"error": "authentication required"}), 401
-        if user["role"] != "admin":
-            return jsonify({"error": "admin access required"}), 403
-        request.current_user = user
-        return f(*args, **kwargs)
-    return wrapper
-
-
-# ---------------------------------------------------------------------------
-# Auth routes
-# ---------------------------------------------------------------------------
-@app.route("/api/auth/signup", methods=["POST"])
-def signup():
-    data = request.get_json(force=True, silent=True) or {}
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
-    if len(username) < 3 or len(password) < 6:
-        return jsonify({"error": "username must be 3+ chars, password 6+ chars"}), 400
-
-    role = "citizen"
-    if data.get("admin_code") and ADMIN_SIGNUP_CODE and data["admin_code"] == ADMIN_SIGNUP_CODE:
-        role = "admin"
-
+def get_hospitals_df():
     conn = get_db()
-    existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
-    if existing:
-        return jsonify({"error": "username already taken"}), 409
-
-    conn.execute(
-        "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
-        (username, generate_password_hash(password), role, datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
-    user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    token = make_token(user["id"])
-    return jsonify({"token": token, "username": user["username"], "role": user["role"]}), 201
+    rows = conn.execute("SELECT * FROM hospitals").fetchall()
+    return pd.DataFrame([dict(r) for r in rows])
 
 
-@app.route("/api/auth/login", methods=["POST"])
-def login():
-    data = request.get_json(force=True, silent=True) or {}
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
+def haversine_km(lat1, lng1, lat2, lng2):
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
 
+
+def nearest_hospital_id(lat, lng, hospitals_df):
+    best_id, best_dist = None, None
+    for _, h in hospitals_df.iterrows():
+        d = haversine_km(lat, lng, h["lat"], h["lng"])
+        if best_dist is None or d < best_dist:
+            best_dist, best_id = d, int(h["id"])
+    return best_id
+
+
+# ---------------------------------------------------------------------------
+# Public routes
+# ---------------------------------------------------------------------------
+@app.route("/api/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/hospitals")
+def list_hospitals():
+    df = get_hospitals_df()
+    return jsonify(df.to_dict(orient="records"))
+
+
+@app.route("/api/hospital-reports", methods=["GET"])
+def get_hospital_reports():
+    days = request.args.get("days", default=21, type=int)
     conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-    if not user or not check_password_hash(user["password_hash"], password):
-        return jsonify({"error": "invalid username or password"}), 401
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """
+        SELECT hospital_reports.id, hospitals.name AS hospital, hospital_reports.disease,
+               hospital_reports.case_count, hospital_reports.report_date
+        FROM hospital_reports JOIN hospitals ON hospital_reports.hospital_id = hospitals.id
+        WHERE hospital_reports.report_date >= ?
+        ORDER BY hospital_reports.report_date DESC
+        """,
+        (cutoff,),
+    ).fetchall()
+    return jsonify([dict(r) for r in rows])
 
-    token = make_token(user["id"])
-    return jsonify({"token": token, "username": user["username"], "role": user["role"]})
 
-
-@app.route("/api/auth/me")
-@require_auth
-def me():
-    u = request.current_user
-    return jsonify({"username": u["username"], "role": u["role"]})
-
-
-# ---------------------------------------------------------------------------
-# Reports
-# ---------------------------------------------------------------------------
-@app.route("/api/reports", methods=["POST"])
-@require_auth
-def add_report():
+@app.route("/api/hospital-reports", methods=["POST"])
+def add_hospital_report():
     data = request.get_json(force=True, silent=True) or {}
-    required = ["lat", "lng", "symptom"]
+    required = ["hospital_id", "disease", "case_count"]
     missing = [k for k in required if k not in data]
     if missing:
         return jsonify({"error": f"missing fields: {missing}"}), 400
+    if data["disease"] not in DISEASES:
+        return jsonify({"error": f"disease must be one of {DISEASES}"}), 400
+    try:
+        hospital_id = int(data["hospital_id"])
+        case_count = int(data["case_count"])
+    except (TypeError, ValueError):
+        return jsonify({"error": "hospital_id and case_count must be integers"}), 400
+    if case_count < 0:
+        return jsonify({"error": "case_count cannot be negative"}), 400
+    report_date = data.get("report_date") or date.today().isoformat()
+
+    conn = get_db()
+    exists = conn.execute("SELECT id FROM hospitals WHERE id = ?", (hospital_id,)).fetchone()
+    if not exists:
+        return jsonify({"error": "unknown hospital_id"}), 400
+
+    conn.execute(
+        """
+        INSERT INTO hospital_reports (hospital_id, disease, case_count, report_date)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(hospital_id, disease, report_date)
+        DO UPDATE SET case_count = excluded.case_count
+        """,
+        (hospital_id, data["disease"], case_count, report_date),
+    )
+    conn.commit()
+    return jsonify({"status": "recorded"}), 201
+
+
+@app.route("/api/citizen-reports", methods=["POST"])
+def add_citizen_report():
+    data = request.get_json(force=True, silent=True) or {}
+    required = ["lat", "lng", "disease"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        return jsonify({"error": f"missing fields: {missing}"}), 400
+    if data["disease"] not in DISEASES:
+        return jsonify({"error": f"disease must be one of {DISEASES}"}), 400
     try:
         lat, lng = float(data["lat"]), float(data["lng"])
     except (TypeError, ValueError):
@@ -250,135 +279,225 @@ def add_report():
 
     conn = get_db()
     conn.execute(
-        "INSERT INTO reports (user_id, lat, lng, symptom, reported_at) VALUES (?, ?, ?, ?, ?)",
-        (request.current_user["id"], lat, lng, data["symptom"], datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO citizen_reports (lat, lng, disease, reported_at) VALUES (?, ?, ?, ?)",
+        (lat, lng, data["disease"], datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
-    return jsonify({"status": "created"}), 201
+    return jsonify({"status": "recorded"}), 201
 
 
 # ---------------------------------------------------------------------------
-# Analytics
+# Prediction engine
 # ---------------------------------------------------------------------------
-def fetch_reports_df(days=None):
+def build_daily_series(days=14):
+    """Returns a dict keyed by (hospital_id, disease) -> {date_str: count},
+    combining hospital-confirmed counts (full weight) with anonymous citizen
+    reports assigned to their nearest hospital locality (partial weight)."""
+    hospitals_df = get_hospitals_df()
     conn = get_db()
-    if days is not None:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        rows = conn.execute(
-            "SELECT * FROM reports WHERE reported_at >= ? ORDER BY reported_at", (cutoff,)
-        ).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM reports ORDER BY reported_at").fetchall()
-    return pd.DataFrame([dict(r) for r in rows])
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
 
+    series = {}
 
-def compute_hotspots(days=14, min_reports=5, window_hours=72, public=True):
-    """Geographic clustering of recent reports (DBSCAN).
+    hosp_rows = conn.execute(
+        "SELECT hospital_id, disease, case_count, report_date FROM hospital_reports WHERE report_date >= ?",
+        (cutoff,),
+    ).fetchall()
+    for r in hosp_rows:
+        key = (r["hospital_id"], r["disease"])
+        series.setdefault(key, {})
+        series[key][r["report_date"]] = series[key].get(r["report_date"], 0) + r["case_count"]
 
-    A cluster becomes a "hotspot" once it has at least `min_reports` reports
-    within the last `window_hours`. This simple count threshold — rather
-    than a statistical baseline comparison — is intentional: a system with
-    no historical data yet has no baseline to compare against, so early on
-    this is the honest way to flag a real, current concentration of
-    reports. If `public` is True, each hotspot returns only a center point,
-    radius, and severity label — never a report count or any individual
-    report data, so the public map can warn people away from an area
-    without exposing who reported what.
-    """
-    df = fetch_reports_df(days=days)
-    if df.empty:
-        return []
-    df["reported_at"] = pd.to_datetime(df["reported_at"], utc=True)
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=window_hours)
-    recent = df[df["reported_at"] >= cutoff]
-    if recent.empty:
-        return []
-
-    coords = recent[["lat", "lng"]].to_numpy()
-    labels = DBSCAN(eps=0.01, min_samples=3).fit(coords).labels_
-    recent = recent.copy()
-    recent["cluster"] = labels
-
-    hotspots = []
-    for label, group in recent[recent["cluster"] != -1].groupby("cluster"):
-        count = len(group)
-        if count < min_reports:
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    citizen_rows = conn.execute(
+        "SELECT lat, lng, disease, reported_at FROM citizen_reports WHERE reported_at >= ?",
+        (cutoff_ts,),
+    ).fetchall()
+    for r in citizen_rows:
+        if hospitals_df.empty:
             continue
-        entry = {
-            "id": int(label),
-            "center_lat": round(float(group["lat"].mean()), 5),
-            "center_lng": round(float(group["lng"].mean()), 5),
-            "radius_m": 1200,
-            "severity": "high" if count >= min_reports * 2 else "moderate",
-        }
-        if not public:
-            entry["report_count"] = count
-            entry["symptoms"] = group["symptom"].value_counts().to_dict()
-        hotspots.append(entry)
-    hotspots.sort(key=lambda h: (h["severity"] != "high"))
-    return hotspots
+        hid = nearest_hospital_id(r["lat"], r["lng"], hospitals_df)
+        d = r["reported_at"][:10]  # date portion of the ISO timestamp
+        key = (hid, r["disease"])
+        series.setdefault(key, {})
+        series[key][d] = series[key].get(d, 0) + CITIZEN_WEIGHT
+
+    return series, hospitals_df
+
+
+def compute_predictions(days=14):
+    series, hospitals_df = build_daily_series(days=days)
+    if hospitals_df.empty:
+        return []
+
+    hospitals_by_id = {int(h["id"]): h for _, h in hospitals_df.iterrows()}
+    today = date.today()
+    predictions = []
+
+    for (hospital_id, disease), counts_by_date in series.items():
+        hospital = hospitals_by_id.get(hospital_id)
+        if hospital is None:
+            continue
+
+        # Build a full daily series for the window, filling gaps with 0.
+        daily = []
+        for i in range(days - 1, -1, -1):
+            d = (today - timedelta(days=i)).isoformat()
+            daily.append(counts_by_date.get(d, 0))
+
+        recent = daily[-3:]
+        baseline = daily[-10:-3] if len(daily) >= 10 else daily[:-3]
+        recent_avg = sum(recent) / len(recent) if recent else 0
+        baseline_avg = (sum(baseline) / len(baseline)) if baseline else 0
+        ratio = recent_avg / max(baseline_avg, 0.5)
+        recent_total = round(sum(recent), 1)
+
+        predicted, risk = False, None
+        if recent_total >= MIN_CASES_FOR_PREDICTION and ratio >= GROWTH_RATIO_MODERATE:
+            predicted = True
+            risk = "high" if ratio >= GROWTH_RATIO_HIGH else "moderate"
+        elif recent_total >= SUSTAINED_HIGH_ABS:
+            predicted = True
+            risk = "moderate"
+
+        if predicted:
+            predictions.append(
+                {
+                    "disease": disease,
+                    "locality": hospital["name"],
+                    "hospital_id": hospital_id,
+                    "lat": float(hospital["lat"]),
+                    "lng": float(hospital["lng"]),
+                    "recent_case_equivalent": recent_total,
+                    "growth_ratio": round(ratio, 2),
+                    "risk": risk,
+                }
+            )
+
+    order = {"high": 0, "moderate": 1}
+    predictions.sort(key=lambda p: (order.get(p["risk"], 2), -p["growth_ratio"]))
+    return predictions
+
+
+@app.route("/api/predictions")
+def predictions_route():
+    return jsonify(compute_predictions())
 
 
 # ---------------------------------------------------------------------------
-# Public routes (no auth — aggregated only)
+# Case counts (public — these are aggregate numbers, not individual records)
 # ---------------------------------------------------------------------------
-@app.route("/api/health")
-def health():
-    return jsonify({"status": "ok"})
-
-
-@app.route("/api/public/hotspots")
-def public_hotspots():
-    return jsonify(compute_hotspots(public=True))
-
-
-# ---------------------------------------------------------------------------
-# Admin routes (raw data — never exposed to regular users)
-# ---------------------------------------------------------------------------
-@app.route("/api/admin/reports")
-@require_admin
-def admin_reports():
-    days = request.args.get("days", default=30, type=int)
+@app.route("/api/case-counts")
+def case_counts():
+    days = request.args.get("days", default=14, type=int)
+    hospitals_df = get_hospitals_df()
     conn = get_db()
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    rows = conn.execute(
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    hosp_totals = conn.execute(
         """
-        SELECT reports.id, reports.lat, reports.lng, reports.symptom, reports.reported_at,
-               users.username
-        FROM reports JOIN users ON reports.user_id = users.id
-        WHERE reports.reported_at >= ?
-        ORDER BY reports.reported_at DESC
+        SELECT hospital_id, disease, SUM(case_count) AS total
+        FROM hospital_reports WHERE report_date >= ? GROUP BY hospital_id, disease
         """,
         (cutoff,),
     ).fetchall()
-    return jsonify([dict(r) for r in rows])
+
+    citizen_rows = conn.execute(
+        "SELECT lat, lng, disease FROM citizen_reports WHERE reported_at >= ?",
+        (cutoff_ts,),
+    ).fetchall()
+    citizen_totals = {}
+    for r in citizen_rows:
+        if hospitals_df.empty:
+            continue
+        hid = nearest_hospital_id(r["lat"], r["lng"], hospitals_df)
+        key = (hid, r["disease"])
+        citizen_totals[key] = citizen_totals.get(key, 0) + 1
+
+    result = []
+    for _, h in hospitals_df.iterrows():
+        hid = int(h["id"])
+        by_disease = {}
+        for row in hosp_totals:
+            if row["hospital_id"] == hid:
+                by_disease.setdefault(row["disease"], {"confirmed": 0, "citizen_reported": 0})
+                by_disease[row["disease"]]["confirmed"] = row["total"]
+        for (chid, disease), c in citizen_totals.items():
+            if chid == hid:
+                by_disease.setdefault(disease, {"confirmed": 0, "citizen_reported": 0})
+                by_disease[disease]["citizen_reported"] = c
+        if by_disease:
+            result.append(
+                {
+                    "hospital": h["name"],
+                    "lat": float(h["lat"]),
+                    "lng": float(h["lng"]),
+                    "by_disease": by_disease,
+                }
+            )
+    return jsonify(result)
 
 
-@app.route("/api/admin/clusters")
-@require_admin
-def admin_clusters():
-    return jsonify(compute_hotspots(min_reports=1, public=False))
-
-
-@app.route("/api/admin/summary")
-@require_admin
-def admin_summary():
+@app.route("/api/summary")
+def summary():
     conn = get_db()
-    total_reports = conn.execute("SELECT COUNT(*) AS c FROM reports").fetchone()["c"]
-    total_users = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    today = datetime.now(timezone.utc).date().isoformat()
-    reports_today = conn.execute(
-        "SELECT COUNT(*) AS c FROM reports WHERE reported_at >= ?", (today,)
+    today_str = date.today().isoformat()
+    today_start_ts = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    hospital_cases_today = conn.execute(
+        "SELECT COALESCE(SUM(case_count), 0) AS c FROM hospital_reports WHERE report_date = ?",
+        (today_str,),
     ).fetchone()["c"]
-    active_hotspots = len(compute_hotspots(public=True))
+    citizen_reports_today = conn.execute(
+        "SELECT COUNT(*) AS c FROM citizen_reports WHERE reported_at >= ?", (today_start_ts,)
+    ).fetchone()["c"]
+    hospitals_reporting = conn.execute(
+        "SELECT COUNT(DISTINCT hospital_id) AS c FROM hospital_reports WHERE report_date >= ?",
+        ((date.today() - timedelta(days=7)).isoformat(),),
+    ).fetchone()["c"]
+    predictions = compute_predictions()
+
     return jsonify(
         {
-            "total_reports": total_reports,
-            "total_users": total_users,
-            "reports_today": reports_today,
-            "active_hotspots": active_hotspots,
+            "predicted_outbreaks": len(predictions),
+            "hospitals_reporting": hospitals_reporting,
+            "cases_today": hospital_cases_today,
+            "citizen_reports_today": citizen_reports_today,
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# News — server-side fetch of Google News RSS (no API key required).
+# Best-effort: any failure returns an empty list rather than an error, so a
+# flaky or blocked outbound request never breaks the rest of the page.
+# ---------------------------------------------------------------------------
+@app.route("/api/news")
+def news():
+    disease = request.args.get("disease", "").strip()
+    locality = request.args.get("locality", "").strip()
+    if not disease:
+        return jsonify({"error": "disease query param required"}), 400
+
+    query = f"{disease} outbreak {locality} India".strip()
+    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+
+    try:
+        resp = requests.get(url, timeout=5, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        root = ElementTree.fromstring(resp.content)
+        items = []
+        for item in root.findall(".//item")[:6]:
+            title = item.findtext("title") or ""
+            link = item.findtext("link") or ""
+            pub_date = item.findtext("pubDate") or ""
+            source_el = item.find("source")
+            source = source_el.text if source_el is not None else ""
+            items.append({"title": title, "link": link, "source": source, "published": pub_date})
+        return jsonify(items)
+    except Exception:
+        return jsonify([])
 
 
 # Initialize the database at import time (not just under __main__) so a
