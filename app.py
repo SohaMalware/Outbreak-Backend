@@ -1,150 +1,166 @@
 """
-Disease Outbreak Early Warning System — backend API (v5).
+Outbreak Early Warning System — backend API (v6).
 
-Major change from v4: this is now global and GPS is used only to tell a
-visitor what's relevant near them — never to submit a report. The
-citizen-symptom-report feature is gone entirely, per the project's
-direction. There is exactly one data source now: news coverage, monitored
-continuously across a fixed set of major cities spanning every inhabited
-continent (see LOCALITIES), for a fixed list of diseases (see DISEASES —
-now includes Ebola).
+What this system does
+---------------------
+Healthcare workers (role "admin") report how many cases of each diagnosed
+disease or potential threat they have seen, with a location. The server
+groups those reports into areas and flags an area when its case counts are
+rising abnormally. That is an early WARNING: it reacts to real, reported
+counts as they change. It does not forecast anything.
 
-Continuous background refresh: rather than only refreshing when someone's
-browser happens to hit /api/refresh-news, a background thread
-(background_news_worker) cycles through every (locality, disease)
-combination on its own, all the time the process is alive, respecting
-REFRESH_MAX_AGE_HOURS so it doesn't re-fetch something already fresh. This
-is what makes the map "live" without requiring a page visit to trigger it.
-Two honest limits on that claim: (1) it can only run while the process is
-alive — most free hosting tiers (including Render's free plan) spin the
-process down after a period with no incoming requests, which pauses the
-background thread too, and it resumes on the next visit; (2) a full sweep
-across every combination takes a while by design (a small delay between
-requests, see BACKGROUND_FETCH_DELAY_SECONDS, to avoid hammering Google
-News) — expect coverage to fill in gradually after each deploy, not
-instantly.
+Only healthcare-worker reports feed the warnings. News headlines are shown
+for information (see /api/news) but are never used in any calculation,
+because headlines can be misleading.
 
-Two different outputs, on purpose:
-- /api/predictions — the strict, threshold-gated list: a locality+disease
-  only appears here once its trend clears the bar (see compute_predictions
-  for the exact logic, unchanged in spirit from v4, now globally scoped
-  and with Ebola added to the seasonal profile — flat, since Ebola
-  outbreaks are tied to spillover events, not a calendar season). This can
-  legitimately be empty. That's not a bug — it means nothing currently
-  monitored has crossed the bar.
-- /api/headlines — an unfiltered, always-fresh-as-available feed of actual
-  fetched articles, so the page has real content to show even when nothing
-  has cleared the stricter prediction bar. This is coverage, not a claim
-  that any given headline represents a confirmed outbreak.
+Who can do what
+---------------
+- Anyone (no account): view warning zones, case counts per area, news.
+- Signed-in user (role "citizen"): everything above, plus receive alerts
+  (in the site's alert inbox, and by email if they keep email alerts on).
+- Healthcare worker (role "admin"): everything above, plus report cases,
+  delete their own reports, and issue alerts to all signed-in users.
 
-What this does NOT do, stated plainly: it does not forecast an outbreak
-appearing somewhere with zero current signal. "Prediction" here means
-catching a real, current rise early — not genuine spatial forecasting to
-unaffected areas. That would need a different, much more data-hungry
-model than a heuristic project like this can responsibly claim.
+Becoming a healthcare worker: sign up with the access code stored in the
+ADMIN_SIGNUP_CODE environment variable (share it only with real staff), and
+give a facility name. This is a shared-secret check, not identity
+verification — a real rollout should have a person approve each account.
 
-Endpoints:
-  GET  /api/health          -> liveness check
-  GET  /api/localities      -> monitored cities worldwide (id, name, lat, lng)
-  POST /api/refresh-news    -> manually trigger a bounded batch refresh (on-demand, in addition to the background worker)
-  GET  /api/predictions     -> threshold-gated predicted outbreaks (may be empty)
-  GET  /api/headlines       -> recent fetched articles, unfiltered (?limit=N)
-  GET  /api/case-counts     -> per-locality case-equivalent totals by disease
-  GET  /api/news            -> ?disease=X&locality=Y -> live headlines for display (on-demand, not cached)
-  GET  /api/summary         -> dashboard counters
+Storage
+-------
+Set DATABASE_URL (a Postgres connection string, e.g. from Neon) and data is
+stored there and survives restarts. With no DATABASE_URL it falls back to a
+local SQLite file, which free hosts such as Render wipe on every restart or
+idle spin-down — fine for local testing, not for real use. /api/health
+reports which one is active.
 
-Run:
-  pip install -r requirements.txt
-  python app.py
-  -> serves on http://127.0.0.1:5000
+Email alerts
+------------
+Sent through Brevo's HTTPS API (BREVO_API_KEY, MAIL_SENDER_EMAIL). SMTP is
+deliberately not used: Render's free tier blocks the SMTP ports. If those
+variables are not set, alerts still reach the in-site inbox and the email
+step is skipped.
+
+Endpoints
+---------
+  GET  /api/health
+  GET  /api/diseases
+  GET  /api/warnings                 public: warning zones + headline numbers
+  GET  /api/news                     public: ?place=&disease= (information only)
+
+  POST /api/auth/signup              {name, email, password, email_alerts?, facility?, access_code?}
+  POST /api/auth/login               {email, password}
+  GET  /api/auth/me
+  POST /api/auth/preferences         {email_alerts}
+
+  GET  /api/alerts                   signed-in: alert inbox
+  POST /api/alerts/<id>/read
+  POST /api/alerts/read-all
+
+  GET  /api/admin/reports            healthcare workers: recent reports
+  POST /api/admin/reports            {disease, case_count, area, lat, lng, report_date?, notes?}
+  DELETE /api/admin/reports/<id>     (own reports only)
+  GET  /api/admin/alerts             alert history
+  POST /api/admin/alerts             {title, message, severity, disease?, area?}
+  GET  /api/admin/summary
 """
 
+import hmac
+import html as htmllib
 import math
 import os
 import re
 import sqlite3
 import threading
 import time
+from collections import Counter
 from datetime import date, datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
+from functools import wraps
 from urllib.parse import quote
 from xml.etree import ElementTree
 
-import pandas as pd
 import requests
 from flask import Flask, g, jsonify, request
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outbreak.db")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("SQLITE_PATH") or os.path.join(BASE_DIR, "outbreak.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+ADMIN_SIGNUP_CODE = os.environ.get("ADMIN_SIGNUP_CODE", "")
+SEED_ADMIN_EMAIL = os.environ.get("SEED_ADMIN_EMAIL", "").strip().lower()
+SEED_ADMIN_PASSWORD = os.environ.get("SEED_ADMIN_PASSWORD", "")
+SEED_ADMIN_FACILITY = os.environ.get("SEED_ADMIN_FACILITY", "Health Department")
+
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+MAIL_SENDER_EMAIL = os.environ.get("MAIL_SENDER_EMAIL", "")
+MAIL_SENDER_NAME = os.environ.get("MAIL_SENDER_NAME", "Outbreak Early Warning")
+SITE_URL = os.environ.get("SITE_URL", "")
+EMAIL_MAX_RECIPIENTS = int(os.environ.get("EMAIL_MAX_RECIPIENTS", "250"))  # stays under Brevo's 300/day free cap
+
+TOKEN_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 
 app = Flask(__name__)
+app.config["SECRET_KEY"] = SECRET_KEY
+serializer = URLSafeTimedSerializer(SECRET_KEY)
 
-DISEASES = ["Dengue", "Malaria", "Cholera", "Typhoid", "Influenza", "COVID-19", "Chikungunya", "Ebola"]
+if SECRET_KEY == "dev-secret-change-me":
+    print("WARNING: SECRET_KEY is not set — using an insecure development key.")
 
-# Major cities spanning every inhabited continent — chosen for realistic
-# news coverage, not tied to any hospital or institution. GPS from a
-# visitor is only ever matched against this list to find what's nearest to
-# them; nothing is ever submitted about a visitor's own location.
-LOCALITIES = [
-    {"name": "Lagos", "lat": 6.5244, "lng": 3.3792},
-    {"name": "Kinshasa", "lat": -4.4419, "lng": 15.2663},
-    {"name": "Nairobi", "lat": -1.2921, "lng": 36.8219},
-    {"name": "Cairo", "lat": 30.0444, "lng": 31.2357},
-    {"name": "Johannesburg", "lat": -26.2041, "lng": 28.0473},
-    {"name": "Mumbai", "lat": 19.0760, "lng": 72.8777},
-    {"name": "Delhi", "lat": 28.7041, "lng": 77.1025},
-    {"name": "Dhaka", "lat": 23.8103, "lng": 90.4125},
-    {"name": "Jakarta", "lat": -6.2088, "lng": 106.8456},
-    {"name": "Manila", "lat": 14.5995, "lng": 120.9842},
-    {"name": "Beijing", "lat": 39.9042, "lng": 116.4074},
-    {"name": "Tokyo", "lat": 35.6762, "lng": 139.6503},
-    {"name": "Bangkok", "lat": 13.7563, "lng": 100.5018},
-    {"name": "Istanbul", "lat": 41.0082, "lng": 28.9784},
-    {"name": "Riyadh", "lat": 24.7136, "lng": 46.6753},
-    {"name": "London", "lat": 51.5074, "lng": -0.1278},
-    {"name": "Paris", "lat": 48.8566, "lng": 2.3522},
-    {"name": "Berlin", "lat": 52.5200, "lng": 13.4050},
-    {"name": "Rome", "lat": 41.9028, "lng": 12.4964},
-    {"name": "Madrid", "lat": 40.4168, "lng": -3.7038},
-    {"name": "New York", "lat": 40.7128, "lng": -74.0060},
-    {"name": "Mexico City", "lat": 19.4326, "lng": -99.1332},
-    {"name": "Sao Paulo", "lat": -23.5505, "lng": -46.6333},
-    {"name": "Lima", "lat": -12.0464, "lng": -77.0428},
-    {"name": "Sydney", "lat": -33.8688, "lng": 151.2093},
+# ---------------------------------------------------------------------------
+# Diseases and early-warning rules
+# ---------------------------------------------------------------------------
+DISEASES = [
+    "Dengue", "Malaria", "Chikungunya", "Cholera", "Typhoid", "Hepatitis A",
+    "Leptospirosis", "Acute diarrhoeal disease", "Influenza", "COVID-19",
+    "Measles", "Mpox", "Tuberculosis", "Nipah virus", "Ebola",
 ]
 
-NEWS_MENTION_WEIGHT = 3  # case-equivalent credited to a relevant headline with no extractable number
-
-MIN_CASES_FOR_PREDICTION = 4
-GROWTH_RATIO_MODERATE = 1.5
-GROWTH_RATIO_HIGH = 2.5
-SUSTAINED_HIGH_ABS = 15
-
-REFRESH_MAX_AGE_HOURS = 2        # background worker won't re-fetch a combo more often than this
-REFRESH_BATCH_LIMIT = 8          # cap for a single POST /api/refresh-news call
-BACKGROUND_FETCH_DELAY_SECONDS = 4   # politeness delay between requests in the background worker
-BACKGROUND_SWEEP_PAUSE_SECONDS = 60  # pause between full passes over the locality x disease list
-
-# Peak months (1=Jan..12=Dec) and how much higher the "normal" baseline is
-# expected to run during them. Outside peak months, multiplier is 1.0.
-# Ebola and COVID-19 are left flat (1.0 year-round): neither has a
-# reliable calendar-season pattern — Ebola outbreaks follow zoonotic
-# spillover events, not seasons, so giving it one would be inventing a
-# pattern that isn't real.
+# How much higher than usual a disease's case counts normally run in its
+# peak months (1=Jan..12=Dec). Outside the peak months the multiplier is 1.
+# These are tuned to the Indian monsoon / winter pattern — change them if
+# the site is used in a region with a different calendar. Diseases that
+# are not listed here (including anything typed in as "Other") get no
+# seasonal adjustment, rather than an invented one.
 SEASONAL_PROFILE = {
-    "Dengue":       {"peak_months": {6, 7, 8, 9, 10}, "peak_multiplier": 1.8},
-    "Cholera":      {"peak_months": {6, 7, 8, 9},      "peak_multiplier": 1.6},
-    "Malaria":      {"peak_months": {6, 7, 8, 9, 10},  "peak_multiplier": 1.5},
-    "Chikungunya":  {"peak_months": {6, 7, 8, 9, 10},  "peak_multiplier": 1.5},
-    "Typhoid":      {"peak_months": {6, 7, 8, 9},      "peak_multiplier": 1.3},
-    "Influenza":    {"peak_months": {11, 12, 1, 2},    "peak_multiplier": 1.7},
-    "COVID-19":     {"peak_months": set(),             "peak_multiplier": 1.0},
-    "Ebola":        {"peak_months": set(),              "peak_multiplier": 1.0},
+    "Dengue":                   {"peak_months": {6, 7, 8, 9, 10}, "peak_multiplier": 1.8},
+    "Malaria":                  {"peak_months": {6, 7, 8, 9, 10}, "peak_multiplier": 1.5},
+    "Chikungunya":              {"peak_months": {6, 7, 8, 9, 10}, "peak_multiplier": 1.5},
+    "Cholera":                  {"peak_months": {6, 7, 8, 9},     "peak_multiplier": 1.6},
+    "Typhoid":                  {"peak_months": {6, 7, 8, 9},     "peak_multiplier": 1.3},
+    "Hepatitis A":              {"peak_months": {6, 7, 8, 9},     "peak_multiplier": 1.3},
+    "Leptospirosis":            {"peak_months": {6, 7, 8, 9},     "peak_multiplier": 1.6},
+    "Acute diarrhoeal disease": {"peak_months": {6, 7, 8, 9},     "peak_multiplier": 1.4},
+    "Influenza":                {"peak_months": {11, 12, 1, 2},   "peak_multiplier": 1.7},
 }
 
-NUM_CASE_RE = re.compile(
-    r"\b(\d{1,6})\b(?:\s+\S+){0,3}?\s+(cases|infections|patients|infected|hospitalisations|hospitalizations|deaths)\b",
-    re.IGNORECASE,
-)
+# For a few high-consequence diseases, a single reported case is already a
+# warning. These are illustrative defaults — the health authority running
+# the site should confirm them against its own notifiable-disease rules.
+SENTINEL_LEVEL = {
+    "Ebola": "high",
+    "Nipah virus": "high",
+    "Cholera": "moderate",
+}
+
+WINDOW_DAYS = 14
+CLUSTER_RADIUS_KM = 5.0
+MIN_CASES = 4              # fewest recent cases before a growth ratio is trusted
+GROWTH_LOW = 1.2
+GROWTH_MODERATE = 1.5
+GROWTH_HIGH = 2.5
+SUSTAINED_ABS = 15         # recent cases that are a warning on their own, before seasonal scaling
+
+LEVEL_RANK = {"low": 1, "moderate": 2, "high": 3}
+# Bullseye ring radii in km at severity 1.0, outermost first.
+RING_BASE_KM = [("low", 4.0), ("moderate", 2.0), ("high", 0.8)]
+RING_SCALE = {"low": 0.6, "moderate": 1.0, "high": 1.5}
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+DISEASE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 \-()'./]{1,59}$")
 
 
 def seasonal_multiplier(disease, month):
@@ -152,13 +168,6 @@ def seasonal_multiplier(disease, month):
     if not profile:
         return 1.0
     return profile["peak_multiplier"] if month in profile["peak_months"] else 1.0
-
-
-def extract_case_count(text):
-    matches = NUM_CASE_RE.findall(text or "")
-    if not matches:
-        return None
-    return max(int(m[0]) for m in matches)
 
 
 def haversine_km(lat1, lng1, lat2, lng2):
@@ -170,14 +179,23 @@ def haversine_km(lat1, lng1, lat2, lng2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def utc_today():
+    return utc_now().date()
+
+
 # ---------------------------------------------------------------------------
-# CORS (manual — the frontend is a static file on a different origin)
+# CORS (the site is a static page on a different origin; auth uses a bearer
+# token in a header, not cookies, so a permissive origin is acceptable)
 # ---------------------------------------------------------------------------
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
 
@@ -187,12 +205,57 @@ def cors_preflight(_any):
 
 
 # ---------------------------------------------------------------------------
-# Database
+# Database layer — one small wrapper so the same SQL runs on SQLite (local /
+# tests) and Postgres (hosted). Queries are written with "?" placeholders.
 # ---------------------------------------------------------------------------
+def to_pg_sql(sql):
+    return sql.replace("?", "%s")
+
+
+class Conn:
+    def __init__(self):
+        if USE_PG:
+            import psycopg2
+            import psycopg2.extras
+
+            self.raw = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+            self._cursor_factory = psycopg2.extras.RealDictCursor
+        else:
+            self.raw = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
+            self.raw.row_factory = sqlite3.Row
+
+    def execute(self, sql, params=()):
+        if USE_PG:
+            cur = self.raw.cursor(cursor_factory=self._cursor_factory)
+            cur.execute(to_pg_sql(sql), params)
+            return cur
+        return self.raw.execute(sql, params)
+
+    def all(self, sql, params=()):
+        return [dict(r) for r in self.execute(sql, params).fetchall()]
+
+    def one(self, sql, params=()):
+        rows = self.all(sql, params)
+        return rows[0] if rows else None
+
+    def insert(self, sql, params=()):
+        """Runs an INSERT and returns the new row's id."""
+        rows = self.execute(sql + " RETURNING id", params).fetchall()
+        return dict(rows[0])["id"]
+
+    def commit(self):
+        self.raw.commit()
+
+    def close(self):
+        try:
+            self.raw.close()
+        except Exception:
+            pass
+
+
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
+        g.db = Conn()
     return g.db
 
 
@@ -204,409 +267,721 @@ def close_db(_exc):
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    pk = "SERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    real = "DOUBLE PRECISION"
+    conn = Conn()
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS localities (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            lat REAL NOT NULL,
-            lng REAL NOT NULL
-        )
-        """
+        f"""CREATE TABLE IF NOT EXISTS users (
+            id {pk},
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'citizen',
+            facility TEXT,
+            email_alerts INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )"""
     )
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS news_signal_cache (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            locality_id INTEGER NOT NULL,
+        f"""CREATE TABLE IF NOT EXISTS reports (
+            id {pk},
+            user_id INTEGER NOT NULL REFERENCES users (id),
             disease TEXT NOT NULL,
-            signal_date TEXT NOT NULL,
-            case_equivalent REAL NOT NULL,
-            fetched_at TEXT NOT NULL,
-            UNIQUE(locality_id, disease, signal_date),
-            FOREIGN KEY (locality_id) REFERENCES localities (id)
-        )
-        """
+            case_count INTEGER NOT NULL,
+            lat {real} NOT NULL,
+            lng {real} NOT NULL,
+            area TEXT NOT NULL,
+            report_date TEXT NOT NULL,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        )"""
     )
     conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS news_headlines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            locality_id INTEGER NOT NULL,
-            disease TEXT NOT NULL,
+        f"""CREATE TABLE IF NOT EXISTS alerts (
+            id {pk},
             title TEXT NOT NULL,
-            link TEXT UNIQUE NOT NULL,
-            source TEXT,
-            published_at TEXT NOT NULL,
-            fetched_at TEXT NOT NULL,
-            FOREIGN KEY (locality_id) REFERENCES localities (id)
-        )
-        """
+            message TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            disease TEXT,
+            area TEXT,
+            created_by INTEGER REFERENCES users (id),
+            created_at TEXT NOT NULL,
+            email_status TEXT NOT NULL DEFAULT 'not sent',
+            email_sent INTEGER NOT NULL DEFAULT 0,
+            email_failed INTEGER NOT NULL DEFAULT 0
+        )"""
     )
+    conn.execute(
+        f"""CREATE TABLE IF NOT EXISTS alert_reads (
+            id {pk},
+            alert_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            read_at TEXT NOT NULL,
+            UNIQUE (alert_id, user_id)
+        )"""
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON reports (report_date)")
     conn.commit()
 
-    count = conn.execute("SELECT COUNT(*) AS c FROM localities").fetchone()[0]
-    if count == 0:
-        conn.executemany(
-            "INSERT INTO localities (name, lat, lng) VALUES (:name, :lat, :lng)", LOCALITIES
-        )
-        conn.commit()
+    # Optional: create the first healthcare-worker account from environment
+    # variables, so the owner never has to share an access code with
+    # themselves — and it comes back after a wipe on hosts without a database.
+    if SEED_ADMIN_EMAIL and SEED_ADMIN_PASSWORD:
+        existing = conn.one("SELECT id FROM users WHERE email = ?", (SEED_ADMIN_EMAIL,))
+        if not existing:
+            conn.insert(
+                "INSERT INTO users (email, name, password_hash, role, facility, email_alerts, created_at) "
+                "VALUES (?, ?, ?, 'admin', ?, 1, ?)",
+                (
+                    SEED_ADMIN_EMAIL,
+                    "Administrator",
+                    generate_password_hash(SEED_ADMIN_PASSWORD),
+                    SEED_ADMIN_FACILITY,
+                    utc_now().isoformat(),
+                ),
+            )
+            conn.commit()
     conn.close()
 
 
-def read_localities_df(conn):
-    rows = conn.execute("SELECT * FROM localities").fetchall()
-    return pd.DataFrame([dict(r) for r in rows])
+# ---------------------------------------------------------------------------
+# Auth helpers
+# ---------------------------------------------------------------------------
+def make_token(user_id):
+    return serializer.dumps({"uid": user_id})
 
 
-def get_localities_df():
-    return read_localities_df(get_db())
+def verify_token(token):
+    try:
+        return serializer.loads(token, max_age=TOKEN_MAX_AGE).get("uid")
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+def current_user():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    uid = verify_token(auth[len("Bearer "):])
+    if uid is None:
+        return None
+    return get_db().one(
+        "SELECT id, email, name, role, facility, email_alerts, created_at FROM users WHERE id = ?",
+        (uid,),
+    )
+
+
+def public_user(u):
+    return {
+        "id": u["id"],
+        "name": u["name"],
+        "email": u["email"],
+        "role": u["role"],
+        "facility": u["facility"],
+        "email_alerts": bool(u["email_alerts"]),
+    }
+
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if user is None:
+            return jsonify({"error": "Please sign in."}), 401
+        g.user = user
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def require_admin(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if user is None:
+            return jsonify({"error": "Please sign in."}), 401
+        if user["role"] != "admin":
+            return jsonify({"error": "This action is only for healthcare workers."}), 403
+        g.user = user
+        return f(*args, **kwargs)
+    return wrapper
+
+
+_login_attempts = {}
+LOGIN_LIMIT = 8
+LOGIN_WINDOW_SECONDS = 600
+
+
+def client_ip():
+    fwd = request.headers.get("X-Forwarded-For", "")
+    return (fwd.split(",")[0].strip() if fwd else request.remote_addr) or "unknown"
+
+
+def _recent_attempts(key):
+    now = time.time()
+    attempts = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+    _login_attempts[key] = attempts
+    return attempts
+
+
+def _json():
+    return request.get_json(force=True, silent=True) or {}
 
 
 # ---------------------------------------------------------------------------
-# Public routes
+# Auth routes
 # ---------------------------------------------------------------------------
+@app.route("/api/auth/signup", methods=["POST"])
+def signup():
+    data = _json()
+    name = (data.get("name") or "").strip()[:80]
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    facility = (data.get("facility") or "").strip()[:120]
+    access_code = data.get("access_code") or ""
+    email_alerts = 1 if data.get("email_alerts", True) else 0
+
+    if len(name) < 2:
+        return jsonify({"error": "Please enter your name."}), 400
+    if not EMAIL_RE.match(email) or len(email) > 254:
+        return jsonify({"error": "Please enter a valid email address."}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters."}), 400
+
+    role = "citizen"
+    if access_code:
+        expected = ADMIN_SIGNUP_CODE.encode("utf-8")
+        if not expected or not hmac.compare_digest(access_code.encode("utf-8"), expected):
+            return jsonify({"error": "That healthcare worker access code is not valid."}), 403
+        if len(facility) < 2:
+            return jsonify({"error": "Please enter your hospital or facility name."}), 400
+        role = "admin"
+    else:
+        facility = ""
+
+    conn = get_db()
+    if conn.one("SELECT id FROM users WHERE email = ?", (email,)):
+        return jsonify({"error": "An account with this email already exists."}), 409
+
+    uid = conn.insert(
+        "INSERT INTO users (email, name, password_hash, role, facility, email_alerts, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (email, name, generate_password_hash(password), role, facility or None, email_alerts, utc_now().isoformat()),
+    )
+    conn.commit()
+    user = conn.one("SELECT id, email, name, role, facility, email_alerts FROM users WHERE id = ?", (uid,))
+    return jsonify({"token": make_token(uid), "user": public_user(user)}), 201
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    data = _json()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    key = f"{client_ip()}|{email}"
+    if len(_recent_attempts(key)) >= LOGIN_LIMIT:
+        return jsonify({"error": "Too many attempts. Please wait a few minutes and try again."}), 429
+
+    conn = get_db()
+    user = conn.one("SELECT * FROM users WHERE email = ?", (email,))
+    if not user or not check_password_hash(user["password_hash"], password):
+        _login_attempts.setdefault(key, []).append(time.time())
+        return jsonify({"error": "Incorrect email or password."}), 401
+
+    _login_attempts.pop(key, None)
+    return jsonify({"token": make_token(user["id"]), "user": public_user(user)})
+
+
+@app.route("/api/auth/me")
+@require_auth
+def me():
+    return jsonify({"user": public_user(g.user)})
+
+
+@app.route("/api/auth/preferences", methods=["POST"])
+@require_auth
+def preferences():
+    data = _json()
+    flag = 1 if data.get("email_alerts") else 0
+    conn = get_db()
+    conn.execute("UPDATE users SET email_alerts = ? WHERE id = ?", (flag, g.user["id"]))
+    conn.commit()
+    return jsonify({"email_alerts": bool(flag)})
+
+
+# ---------------------------------------------------------------------------
+# Healthcare-worker reports
+# ---------------------------------------------------------------------------
+def clean_disease(raw):
+    name = re.sub(r"\s+", " ", (raw or "").strip())
+    if not DISEASE_RE.match(name):
+        return None
+    for known in DISEASES:
+        if known.lower() == name.lower():
+            return known
+    return name
+
+
+@app.route("/api/diseases")
+def diseases():
+    return jsonify(DISEASES)
+
+
+@app.route("/api/admin/reports", methods=["POST"])
+@require_admin
+def admin_add_report():
+    data = _json()
+    disease = clean_disease(data.get("disease"))
+    if not disease:
+        return jsonify({"error": "Please choose a disease or enter its name."}), 400
+    try:
+        case_count = int(data.get("case_count"))
+        lat = float(data.get("lat"))
+        lng = float(data.get("lng"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Case count and location are required."}), 400
+    if not 0 <= case_count <= 100000:
+        return jsonify({"error": "Case count must be between 0 and 100,000."}), 400
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return jsonify({"error": "That location is not valid."}), 400
+    area = (data.get("area") or "").strip()[:80]
+    if len(area) < 2:
+        return jsonify({"error": "Please enter the area or locality name."}), 400
+    notes = (data.get("notes") or "").strip()[:300] or None
+
+    today = utc_today()
+    try:
+        report_date = date.fromisoformat(data.get("report_date") or today.isoformat())
+    except ValueError:
+        return jsonify({"error": "That date is not valid."}), 400
+    if report_date > today + timedelta(days=1):
+        return jsonify({"error": "The date cannot be in the future."}), 400
+    if report_date < today - timedelta(days=60):
+        return jsonify({"error": "Reports can only be dated within the last 60 days."}), 400
+
+    conn = get_db()
+    rid = conn.insert(
+        "INSERT INTO reports (user_id, disease, case_count, lat, lng, area, report_date, notes, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (g.user["id"], disease, case_count, lat, lng, area, report_date.isoformat(), notes, utc_now().isoformat()),
+    )
+    conn.commit()
+    return jsonify({"id": rid, "status": "recorded"}), 201
+
+
+@app.route("/api/admin/reports")
+@require_admin
+def admin_list_reports():
+    days = max(1, min(request.args.get("days", default=30, type=int), 90))
+    cutoff = (utc_today() - timedelta(days=days)).isoformat()
+    rows = get_db().all(
+        """SELECT r.id, r.disease, r.case_count, r.lat, r.lng, r.area, r.report_date, r.notes,
+                  r.created_at, r.user_id, u.name AS reporter, u.facility AS facility
+           FROM reports r JOIN users u ON r.user_id = u.id
+           WHERE r.report_date >= ?
+           ORDER BY r.report_date DESC, r.id DESC
+           LIMIT 200""",
+        (cutoff,),
+    )
+    for r in rows:
+        r["mine"] = r["user_id"] == g.user["id"]
+        del r["user_id"]
+    return jsonify(rows)
+
+
+@app.route("/api/admin/reports/<int:report_id>", methods=["DELETE"])
+@require_admin
+def admin_delete_report(report_id):
+    conn = get_db()
+    row = conn.one("SELECT id, user_id FROM reports WHERE id = ?", (report_id,))
+    if not row:
+        return jsonify({"error": "Report not found."}), 404
+    if row["user_id"] != g.user["id"]:
+        return jsonify({"error": "You can only delete reports you submitted."}), 403
+    conn.execute("DELETE FROM reports WHERE id = ?", (report_id,))
+    conn.commit()
+    return jsonify({"status": "deleted"})
+
+
+# ---------------------------------------------------------------------------
+# Early-warning engine. Reads healthcare-worker reports only.
+# ---------------------------------------------------------------------------
+def build_warning(disease, items, today):
+    """Turns one geographic group of reports for one disease into a warning
+    (or None if nothing about it deserves one)."""
+    today_iso = today.isoformat()
+    daily = {}
+    for it in items:
+        d = min(it["report_date"], today_iso)  # a report dated "tomorrow" in another timezone counts as today
+        daily[d] = daily.get(d, 0) + it["case_count"]
+    series = [daily.get((today - timedelta(days=i)).isoformat(), 0) for i in range(WINDOW_DAYS - 1, -1, -1)]
+
+    recent = series[-3:]
+    baseline = series[-10:-3]
+    recent_total = sum(recent)
+    if recent_total <= 0:
+        return None
+    recent_avg = recent_total / 3
+    baseline_avg = sum(baseline) / len(baseline)
+    raw_ratio = recent_avg / max(baseline_avg, 0.5)
+
+    mult = seasonal_multiplier(disease, today.month)
+    adjusted = raw_ratio / mult  # in a disease's peak season the same rise counts for less
+
+    candidates = []
+    sentinel = SENTINEL_LEVEL.get(disease)
+    if sentinel:
+        candidates.append(sentinel)
+    if recent_total >= MIN_CASES and adjusted >= GROWTH_HIGH:
+        candidates.append("high")
+    elif recent_total >= MIN_CASES and adjusted >= GROWTH_MODERATE:
+        candidates.append("moderate")
+    if recent_total >= SUSTAINED_ABS * mult * 2:
+        candidates.append("high")
+    elif recent_total >= SUSTAINED_ABS * mult:
+        candidates.append("moderate")
+    if recent_total >= 2 and adjusted >= GROWTH_LOW:
+        candidates.append("low")
+    if not candidates:
+        return None
+    level = max(candidates, key=LEVEL_RANK.get)
+
+    weights = [max(it["case_count"], 0) for it in items]
+    total_w = sum(weights)
+    if total_w > 0:
+        lat = sum(it["lat"] * w for it, w in zip(items, weights)) / total_w
+        lng = sum(it["lng"] * w for it, w in zip(items, weights)) / total_w
+    else:
+        lat = sum(it["lat"] for it in items) / len(items)
+        lng = sum(it["lng"] for it in items) / len(items)
+
+    area_counts = Counter()
+    for it in items:
+        area_counts[it["area"].strip()] += max(it["case_count"], 1)
+    area = area_counts.most_common(1)[0][0]
+
+    week_cutoff = (today - timedelta(days=6)).isoformat()
+    facilities = sorted({it["facility"] for it in items if it["report_date"] >= week_cutoff and it["facility"]})
+    scale = RING_SCALE[level]
+
+    return {
+        "id": f"{disease}|{round(lat, 3)}|{round(lng, 3)}",
+        "disease": disease,
+        "level": level,
+        "area": area,
+        "lat": round(lat, 5),
+        "lng": round(lng, 5),
+        "cases_3d": recent_total,
+        "cases_7d": sum(series[-7:]),
+        "growth": round(adjusted, 1),
+        "in_season": mult > 1.0,
+        "facilities": facilities[:5],
+        "facility_count": len(facilities),
+        "last_report_at": max(it["created_at"] for it in items),
+        "rings": [{"level": lv, "radius_m": int(km * scale * 1000)} for lv, km in RING_BASE_KM],
+    }
+
+
+def compute_warnings(conn):
+    today = utc_today()
+    cutoff = (today - timedelta(days=WINDOW_DAYS)).isoformat()
+    rows = conn.all(
+        """SELECT r.id, r.disease, r.case_count, r.lat, r.lng, r.area, r.report_date, r.created_at,
+                  u.facility AS facility
+           FROM reports r JOIN users u ON r.user_id = u.id
+           WHERE r.report_date >= ?""",
+        (cutoff,),
+    )
+    by_disease = {}
+    for r in rows:
+        by_disease.setdefault(r["disease"], []).append(r)
+
+    warnings = []
+    for disease, items in by_disease.items():
+        clusters = []
+        for r in sorted(items, key=lambda x: (x["report_date"], x["id"])):
+            best, best_d = None, None
+            for c in clusters:
+                d = haversine_km(r["lat"], r["lng"], c["lat"], c["lng"])
+                if d <= CLUSTER_RADIUS_KM and (best_d is None or d < best_d):
+                    best, best_d = c, d
+            if best is None:
+                clusters.append({"lat": r["lat"], "lng": r["lng"], "items": [r]})
+            else:
+                best["items"].append(r)
+        for c in clusters:
+            w = build_warning(disease, c["items"], today)
+            if w:
+                warnings.append(w)
+
+    warnings.sort(key=lambda w: (-LEVEL_RANK[w["level"]], -w["cases_3d"]))
+
+    week_cutoff = (today - timedelta(days=6)).isoformat()
+    totals = conn.one(
+        """SELECT COALESCE(SUM(r.case_count), 0) AS cases, COUNT(DISTINCT u.facility) AS facilities
+           FROM reports r JOIN users u ON r.user_id = u.id WHERE r.report_date >= ?""",
+        (week_cutoff,),
+    )
+    stats = {
+        "active": len(warnings),
+        "high": sum(1 for w in warnings if w["level"] == "high"),
+        "moderate": sum(1 for w in warnings if w["level"] == "moderate"),
+        "low": sum(1 for w in warnings if w["level"] == "low"),
+        "cases_7d": int(totals["cases"] or 0),
+        "facilities_reporting": int(totals["facilities"] or 0),
+    }
+    return warnings, stats
+
+
+@app.route("/api/warnings")
+def warnings_route():
+    warnings, stats = compute_warnings(get_db())
+    return jsonify({"warnings": warnings, "stats": stats, "updated_at": utc_now().isoformat()})
+
+
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok"})
-
-
-@app.route("/api/localities")
-def list_localities():
-    df = get_localities_df()
-    return jsonify(df.to_dict(orient="records"))
-
-
-# ---------------------------------------------------------------------------
-# News signal — event-based surveillance via Google News RSS (no API key)
-# ---------------------------------------------------------------------------
-def fetch_and_store_news_signal(conn, locality_id, locality_name, disease):
-    """Best-effort: fetches recent headlines for this locality+disease,
-    stores each individual article (deduped by link) in news_headlines for
-    the always-on live feed, and buckets any extractable case-equivalent by
-    the headline's publish date into news_signal_cache for the stricter
-    prediction math. Any failure is swallowed — a stale or empty cache
-    entry is fine; it just means fewer/no results this cycle."""
-    query = f"{disease} cases {locality_name}"
-    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
-    now_iso = datetime.now(timezone.utc).isoformat()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=5)
-
-    counts_by_date = {}
-    fetch_succeeded = False
-    try:
-        resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        root = ElementTree.fromstring(resp.content)
-        fetch_succeeded = True
-        for item in root.findall(".//item")[:8]:
-            title = item.findtext("title") or ""
-            link = item.findtext("link") or ""
-            pub_date_raw = item.findtext("pubDate") or ""
-            source_el = item.find("source")
-            source = source_el.text if source_el is not None else ""
-            try:
-                pub_dt = parsedate_to_datetime(pub_date_raw)
-                if pub_dt.tzinfo is None:
-                    pub_dt = pub_dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                pub_dt = datetime.now(timezone.utc)
-            if pub_dt < cutoff:
-                continue
-
-            if link:
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO news_headlines
-                            (locality_id, disease, title, link, source, published_at, fetched_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(link) DO NOTHING
-                        """,
-                        (locality_id, disease, title, link, source, pub_dt.isoformat(), now_iso),
-                    )
-                except Exception:
-                    pass
-
-            d = pub_dt.date().isoformat()
-            n = extract_case_count(title)
-            counts_by_date[d] = counts_by_date.get(d, 0) + (n if n is not None else NEWS_MENTION_WEIGHT)
-    except Exception:
-        pass  # network hiccup, blocked, or malformed feed — leave cache as-is below
-
-    if counts_by_date:
-        for d, c in counts_by_date.items():
-            conn.execute(
-                """
-                INSERT INTO news_signal_cache (locality_id, disease, signal_date, case_equivalent, fetched_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(locality_id, disease, signal_date)
-                DO UPDATE SET case_equivalent = excluded.case_equivalent, fetched_at = excluded.fetched_at
-                """,
-                (locality_id, disease, d, c, now_iso),
-            )
-    elif fetch_succeeded:
-        # Genuinely fetched successfully and found nothing relevant — safe
-        # to mark as checked so we don't re-fetch again within the window.
-        today_str = date.today().isoformat()
-        conn.execute(
-            """
-            INSERT INTO news_signal_cache (locality_id, disease, signal_date, case_equivalent, fetched_at)
-            VALUES (?, ?, ?, 0, ?)
-            ON CONFLICT(locality_id, disease, signal_date)
-            DO UPDATE SET fetched_at = excluded.fetched_at
-            """,
-            (locality_id, disease, today_str, now_iso),
-        )
-    # else: the fetch itself failed (network error, blocked, malformed feed)
-    # — leave the cache untouched so this combo is retried on the next pass
-    # instead of being wrongly marked as checked.
-    conn.commit()
-
-
-def _stale_combos(conn, limit=None):
-    localities_df = read_localities_df(conn)
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=REFRESH_MAX_AGE_HOURS)).isoformat()
-    combos = []
-    for _, loc in localities_df.iterrows():
-        for disease in DISEASES:
-            row = conn.execute(
-                """
-                SELECT fetched_at FROM news_signal_cache
-                WHERE locality_id = ? AND disease = ? ORDER BY fetched_at DESC LIMIT 1
-                """,
-                (int(loc["id"]), disease),
-            ).fetchone()
-            if row and row["fetched_at"] >= cutoff:
-                continue
-            combos.append((int(loc["id"]), loc["name"], disease))
-            if limit and len(combos) >= limit:
-                return combos
-    return combos
-
-
-@app.route("/api/refresh-news", methods=["POST"])
-def refresh_news():
-    conn = get_db()
-    combos = _stale_combos(conn, limit=REFRESH_BATCH_LIMIT)
-    for locality_id, locality_name, disease in combos:
-        fetch_and_store_news_signal(conn, locality_id, locality_name, disease)
-    return jsonify({"refreshed": len(combos)})
-
-
-def background_news_worker():
-    """Runs for the lifetime of the process, cycling through every
-    (locality, disease) combination and refreshing whichever ones have
-    gone stale, with a small delay between requests. See the module
-    docstring for what this can and can't guarantee on free hosting."""
-    while True:
-        try:
-            conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            combos = _stale_combos(conn)
-            for locality_id, locality_name, disease in combos:
-                fetch_and_store_news_signal(conn, locality_id, locality_name, disease)
-                time.sleep(BACKGROUND_FETCH_DELAY_SECONDS)
-            conn.close()
-        except Exception:
-            pass
-        time.sleep(BACKGROUND_SWEEP_PAUSE_SECONDS)
-
-
-# ---------------------------------------------------------------------------
-# Prediction engine — reads the cache only, so it's always fast regardless
-# of how the cache gets populated (background worker or manual refresh).
-# ---------------------------------------------------------------------------
-def build_daily_series(days=14):
-    localities_df = get_localities_df()
-    conn = get_db()
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
-
-    series = {}
-    rows = conn.execute(
-        "SELECT locality_id, disease, case_equivalent, signal_date FROM news_signal_cache WHERE signal_date >= ?",
-        (cutoff,),
-    ).fetchall()
-    for r in rows:
-        key = (r["locality_id"], r["disease"])
-        series.setdefault(key, {})
-        series[key][r["signal_date"]] = series[key].get(r["signal_date"], 0) + r["case_equivalent"]
-
-    return series, localities_df
-
-
-def compute_predictions(days=14):
-    series, localities_df = build_daily_series(days=days)
-    if localities_df.empty:
-        return []
-
-    localities_by_id = {int(l["id"]): l for _, l in localities_df.iterrows()}
-    today = date.today()
-    predictions = []
-
-    for (locality_id, disease), counts_by_date in series.items():
-        locality = localities_by_id.get(locality_id)
-        if locality is None:
-            continue
-
-        daily = []
-        for i in range(days - 1, -1, -1):
-            d = (today - timedelta(days=i)).isoformat()
-            daily.append(counts_by_date.get(d, 0))
-
-        recent = daily[-3:]
-        baseline = daily[-10:-3] if len(daily) >= 10 else daily[:-3]
-        recent_avg = sum(recent) / len(recent) if recent else 0
-        baseline_avg = (sum(baseline) / len(baseline)) if baseline else 0
-        raw_ratio = recent_avg / max(baseline_avg, 0.5)
-        recent_total = round(sum(recent), 1)
-
-        mult = seasonal_multiplier(disease, today.month)
-        adjusted_ratio = raw_ratio / mult
-        adjusted_sustained_threshold = SUSTAINED_HIGH_ABS * mult
-
-        predicted, risk = False, None
-        if recent_total >= MIN_CASES_FOR_PREDICTION and adjusted_ratio >= GROWTH_RATIO_MODERATE:
-            predicted = True
-            risk = "high" if adjusted_ratio >= GROWTH_RATIO_HIGH else "moderate"
-        elif recent_total >= adjusted_sustained_threshold:
-            predicted = True
-            risk = "moderate"
-
-        if predicted:
-            predictions.append(
-                {
-                    "disease": disease,
-                    "locality": locality["name"],
-                    "locality_id": locality_id,
-                    "lat": float(locality["lat"]),
-                    "lng": float(locality["lng"]),
-                    "recent_case_equivalent": recent_total,
-                    "growth_ratio": round(adjusted_ratio, 2),
-                    "risk": risk,
-                    "in_season": mult > 1.0,
-                }
-            )
-
-    order = {"high": 0, "moderate": 1}
-    predictions.sort(key=lambda p: (order.get(p["risk"], 2), -p["growth_ratio"]))
-    return predictions
-
-
-@app.route("/api/predictions")
-def predictions_route():
-    return jsonify(compute_predictions())
-
-
-@app.route("/api/headlines")
-def headlines_route():
-    limit = request.args.get("limit", default=25, type=int)
-    conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT news_headlines.title, news_headlines.link, news_headlines.source,
-               news_headlines.published_at, news_headlines.disease,
-               localities.name AS locality, localities.lat AS lat, localities.lng AS lng
-        FROM news_headlines JOIN localities ON news_headlines.locality_id = localities.id
-        ORDER BY news_headlines.published_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-    return jsonify([dict(r) for r in rows])
-
-
-# ---------------------------------------------------------------------------
-# Case counts — aggregate only
-# ---------------------------------------------------------------------------
-@app.route("/api/case-counts")
-def case_counts():
-    days = request.args.get("days", default=14, type=int)
-    localities_df = get_localities_df()
-    conn = get_db()
-    cutoff = (date.today() - timedelta(days=days)).isoformat()
-
-    news_totals = conn.execute(
-        """
-        SELECT locality_id, disease, SUM(case_equivalent) AS total
-        FROM news_signal_cache WHERE signal_date >= ? GROUP BY locality_id, disease
-        """,
-        (cutoff,),
-    ).fetchall()
-
-    result = []
-    for _, loc in localities_df.iterrows():
-        lid = int(loc["id"])
-        by_disease = {}
-        for row in news_totals:
-            if row["locality_id"] == lid and row["total"]:
-                by_disease[row["disease"]] = round(row["total"], 1)
-        if by_disease:
-            result.append(
-                {"locality": loc["name"], "lat": float(loc["lat"]), "lng": float(loc["lng"]), "by_disease": by_disease}
-            )
-    return jsonify(result)
-
-
-@app.route("/api/summary")
-def summary():
-    conn = get_db()
-    today_str = date.today().isoformat()
-
-    media_signals_today = conn.execute(
-        "SELECT COALESCE(SUM(case_equivalent), 0) AS c FROM news_signal_cache WHERE signal_date = ?",
-        (today_str,),
-    ).fetchone()["c"]
-    headlines_tracked = conn.execute("SELECT COUNT(*) AS c FROM news_headlines").fetchone()["c"]
-    predictions = compute_predictions()
-
     return jsonify(
         {
-            "predicted_outbreaks": len(predictions),
-            "localities_monitored": len(LOCALITIES),
-            "media_signals_today": round(media_signals_today, 1),
-            "headlines_tracked": headlines_tracked,
+            "status": "ok",
+            "storage": "postgres" if USE_PG else "sqlite",
+            "email_configured": bool(BREVO_API_KEY and MAIL_SENDER_EMAIL),
         }
     )
 
 
 # ---------------------------------------------------------------------------
-# News — live fetch for on-screen display when someone taps a prediction
+# Alerts
 # ---------------------------------------------------------------------------
+def deliver_alert_emails(alert_id, recipients, title, message, severity, disease, area):
+    """Sends one email per recipient through Brevo's HTTPS API, then records
+    how many went out. Runs in a background thread so issuing an alert
+    returns immediately."""
+    sent = failed = 0
+    status = "sent"
+    if not (BREVO_API_KEY and MAIL_SENDER_EMAIL):
+        status = "email not configured"
+    else:
+        label = {"low": "Low", "moderate": "Moderate", "high": "High"}.get(severity, severity)
+        where = " · ".join(x for x in [disease, area] if x)
+        link = f'<p><a href="{htmllib.escape(SITE_URL)}">Open the early warning map</a></p>' if SITE_URL else ""
+        body = (
+            f'<div style="font-family:Arial,sans-serif;max-width:560px">'
+            f'<p style="margin:0 0 4px;color:#555">{htmllib.escape(label)} level alert'
+            f'{" · " + htmllib.escape(where) if where else ""}</p>'
+            f'<h2 style="margin:0 0 12px">{htmllib.escape(title)}</h2>'
+            f'<p style="white-space:pre-wrap">{htmllib.escape(message)}</p>{link}'
+            f'<hr><p style="font-size:12px;color:#777">You are receiving this because you have an account with '
+            f"email alerts turned on. Sign in to the site to turn them off.</p></div>"
+        )
+        for email in recipients[:EMAIL_MAX_RECIPIENTS]:
+            try:
+                resp = requests.post(
+                    "https://api.brevo.com/v3/smtp/email",
+                    headers={"api-key": BREVO_API_KEY, "accept": "application/json", "content-type": "application/json"},
+                    json={
+                        "sender": {"name": MAIL_SENDER_NAME, "email": MAIL_SENDER_EMAIL},
+                        "to": [{"email": email}],
+                        "subject": f"[{label}] {title}",
+                        "htmlContent": body,
+                    },
+                    timeout=10,
+                )
+                if resp.status_code in (200, 201):
+                    sent += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+            time.sleep(0.1)
+        if len(recipients) > EMAIL_MAX_RECIPIENTS:
+            failed += len(recipients) - EMAIL_MAX_RECIPIENTS
+        if failed and not sent:
+            status = "failed"
+        elif failed:
+            status = "partly sent"
+
+    conn = Conn()
+    try:
+        conn.execute(
+            "UPDATE alerts SET email_status = ?, email_sent = ?, email_failed = ? WHERE id = ?",
+            (status, sent, failed, alert_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.route("/api/admin/alerts", methods=["POST"])
+@require_admin
+def admin_issue_alert():
+    data = _json()
+    title = (data.get("title") or "").strip()[:120]
+    message = (data.get("message") or "").strip()[:1500]
+    severity = data.get("severity")
+    disease = (data.get("disease") or "").strip()[:60] or None
+    area = (data.get("area") or "").strip()[:80] or None
+    if len(title) < 3 or len(message) < 5:
+        return jsonify({"error": "Please enter a title and a message."}), 400
+    if severity not in LEVEL_RANK:
+        return jsonify({"error": "Please choose a severity level."}), 400
+
+    conn = get_db()
+    hour_ago = (utc_now() - timedelta(hours=1)).isoformat()
+    recent = conn.one(
+        "SELECT COUNT(*) AS c FROM alerts WHERE created_by = ? AND created_at >= ?", (g.user["id"], hour_ago)
+    )["c"]
+    if recent >= 10:
+        return jsonify({"error": "You have issued 10 alerts in the last hour. Please wait before sending more."}), 429
+
+    aid = conn.insert(
+        "INSERT INTO alerts (title, message, severity, disease, area, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (title, message, severity, disease, area, g.user["id"], utc_now().isoformat()),
+    )
+    conn.commit()
+
+    recipients = [r["email"] for r in conn.all("SELECT email FROM users WHERE email_alerts = 1")]
+    total_users = conn.one("SELECT COUNT(*) AS c FROM users")["c"]
+    email_ready = bool(BREVO_API_KEY and MAIL_SENDER_EMAIL)
+    threading.Thread(
+        target=deliver_alert_emails,
+        args=(aid, recipients, title, message, severity, disease, area),
+        daemon=True,
+    ).start()
+    return (
+        jsonify(
+            {
+                "id": aid,
+                "inbox_recipients": total_users,
+                "email_recipients": len(recipients) if email_ready else 0,
+                "email_configured": email_ready,
+            }
+        ),
+        201,
+    )
+
+
+@app.route("/api/admin/alerts")
+@require_admin
+def admin_list_alerts():
+    rows = get_db().all(
+        """SELECT a.id, a.title, a.message, a.severity, a.disease, a.area, a.created_at,
+                  a.email_status, a.email_sent, a.email_failed, u.name AS issued_by
+           FROM alerts a LEFT JOIN users u ON a.created_by = u.id
+           ORDER BY a.created_at DESC LIMIT 50"""
+    )
+    return jsonify(rows)
+
+
+@app.route("/api/admin/summary")
+@require_admin
+def admin_summary():
+    conn = get_db()
+    return jsonify(
+        {
+            "users": conn.one("SELECT COUNT(*) AS c FROM users")["c"],
+            "healthcare_workers": conn.one("SELECT COUNT(*) AS c FROM users WHERE role = 'admin'")["c"],
+            "email_subscribers": conn.one("SELECT COUNT(*) AS c FROM users WHERE email_alerts = 1")["c"],
+            "reports": conn.one("SELECT COUNT(*) AS c FROM reports")["c"],
+            "alerts": conn.one("SELECT COUNT(*) AS c FROM alerts")["c"],
+        }
+    )
+
+
+ALERT_WINDOW_DAYS = 30
+
+
+@app.route("/api/alerts")
+@require_auth
+def my_alerts():
+    cutoff = (utc_now() - timedelta(days=ALERT_WINDOW_DAYS)).isoformat()
+    rows = get_db().all(
+        """SELECT a.id, a.title, a.message, a.severity, a.disease, a.area, a.created_at,
+                  (SELECT COUNT(*) FROM alert_reads x WHERE x.alert_id = a.id AND x.user_id = ?) AS is_read
+           FROM alerts a WHERE a.created_at >= ? ORDER BY a.created_at DESC LIMIT 50""",
+        (g.user["id"], cutoff),
+    )
+    for r in rows:
+        r["read"] = bool(r.pop("is_read"))
+    return jsonify({"alerts": rows, "unread": sum(1 for r in rows if not r["read"])})
+
+
+@app.route("/api/alerts/<int:alert_id>/read", methods=["POST"])
+@require_auth
+def mark_read(alert_id):
+    conn = get_db()
+    if not conn.one("SELECT id FROM alerts WHERE id = ?", (alert_id,)):
+        return jsonify({"error": "Alert not found."}), 404
+    conn.execute(
+        "INSERT INTO alert_reads (alert_id, user_id, read_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+        (alert_id, g.user["id"], utc_now().isoformat()),
+    )
+    conn.commit()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/alerts/read-all", methods=["POST"])
+@require_auth
+def mark_all_read():
+    conn = get_db()
+    cutoff = (utc_now() - timedelta(days=ALERT_WINDOW_DAYS)).isoformat()
+    for a in conn.all("SELECT id FROM alerts WHERE created_at >= ?", (cutoff,)):
+        conn.execute(
+            "INSERT INTO alert_reads (alert_id, user_id, read_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
+            (a["id"], g.user["id"], utc_now().isoformat()),
+        )
+    conn.commit()
+    return jsonify({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
+# News — information only. Never used in any warning calculation.
+# ---------------------------------------------------------------------------
+_news_cache = {}
+NEWS_TTL_SECONDS = 900
+
+
 @app.route("/api/news")
 def news():
-    disease = request.args.get("disease", "").strip()
-    locality = request.args.get("locality", "").strip()
-    if not disease:
-        return jsonify({"error": "disease query param required"}), 400
+    place = (request.args.get("place") or "").strip()[:80]
+    disease = (request.args.get("disease") or "").strip()[:60]
+    if disease:
+        query = f"{disease} outbreak {place}".strip()
+    elif place:
+        query = f"{place} disease outbreak health alert"
+    else:
+        query = "disease outbreak health alert"
 
-    query = f"{disease} outbreak {locality}".strip()
-    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
+    cached = _news_cache.get(query)
+    if cached and time.time() - cached[0] < NEWS_TTL_SECONDS:
+        return jsonify({"query": query, "ok": True, "items": cached[1]})
 
+    url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-IN&gl=IN&ceid=IN:en"
     try:
         resp = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         root = ElementTree.fromstring(resp.content)
         items = []
-        for item in root.findall(".//item")[:6]:
-            title = item.findtext("title") or ""
-            link = item.findtext("link") or ""
-            pub_date = item.findtext("pubDate") or ""
+        for item in root.findall(".//item")[:8]:
             source_el = item.find("source")
-            source = source_el.text if source_el is not None else ""
-            items.append({"title": title, "link": link, "source": source, "published": pub_date})
-        return jsonify(items)
+            items.append(
+                {
+                    "title": item.findtext("title") or "",
+                    "link": item.findtext("link") or "",
+                    "source": source_el.text if source_el is not None else "",
+                    "published": item.findtext("pubDate") or "",
+                }
+            )
+        _news_cache[query] = (time.time(), items)
+        return jsonify({"query": query, "ok": True, "items": items})
     except Exception:
-        return jsonify([])
+        return jsonify({"query": query, "ok": False, "items": []})
 
 
-# Initialize the database at import time so a production WSGI server like
-# gunicorn (which imports this module and never runs the block below)
-# still gets a ready database and a running background worker.
+# Create tables at import time so a production server such as gunicorn
+# (which imports this module and never runs the block below) is ready.
 init_db()
-threading.Thread(target=background_news_worker, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
